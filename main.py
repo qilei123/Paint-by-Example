@@ -22,6 +22,9 @@ from ldm.util import instantiate_from_config
 import socket
 from pytorch_lightning.plugins.environments import ClusterEnvironment,SLURMEnvironment
 
+import warnings
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 def get_parser(**parser_kwargs):
     def str2bool(v):
         if isinstance(v, bool):

@@ -28,7 +28,33 @@ import math
 from functools import partial
 import albumentations as A
 import bezier
+from pycocotools.coco import COCO
 
+#from med import dataset_records
+#from med import check_and_fix_bbox
+dataset_records = {"dataset_test":{"gastro_cancer/xiehe_far_1":[1],},
+                "dataset1":
+                {"gastro_cancer/xiehe_far_1":[1], #0
+                "gastro_cancer/xiehe_far_2":[1], #1
+                "gastro_cancer/xiangya_far_2021":[1], #2
+                "gastro_cancer/xiangya_far_2022":[1], #3
+                "gastro_cancer/xiehe_far_1":[1], #0
+                "gastro_cancer/xiehe_far_2":[1], #1
+                "gastro_cancer/xiangya_far_2021":[1], #2
+                "gastro_cancer/xiangya_far_2022":[1], #3
+                "gastro_cancer/gastro8-12/2021-2022年癌变已标注/20221111/2021_2022_癌变_20221111":[1,4,5], #4
+                "gastro_cancer/gastro8-12/低级别_2021_2022已标注/2021_2022_低级别_20221110":[1,4,5], #5
+                "gastro_cancer/gastro8-12/协和2022_第一批胃早癌视频裁图已标注/20221115/癌变2022_20221115":[1,4,5], #6
+                "gastro_cancer/gastro8-12/协和2022_第二批胃早癌视频裁图已标注/协和_2022_癌变_2_20221117":[1,4,5], #7
+                "gastro_cancer/gastro8-12/协和21-11月~2022-5癌变已标注/协和2021-11月_2022-5癌变_20221121":[1,4,5], #8
+                },}
+
+def check_and_fix_bbox(bbox,width,height):
+    bbox[0] = 1 if bbox[0]<0 else bbox[0]
+    bbox[1] = 1 if bbox[1]<0 else bbox[1]
+    bbox[2] = width-bbox[0] if bbox[0]+bbox[2]>width else bbox[2]
+    bbox[3] = height-bbox[1] if bbox[1]+bbox[3]>height else bbox[3]    
+    return [int(value) for value in bbox] 
 
 def bbox_process(bbox):
     x_min = int(bbox[0])
@@ -256,5 +282,232 @@ class OpenImageDataset(data.Dataset):
     def __len__(self):
         return self.length
 
+class GastroDataset(data.Dataset):
+    def __init__(self,state,arbitrary_mask_percent=0,**args
+        ):
+        self.state=state
+        self.args=args
+        self.arbitrary_mask_percent=arbitrary_mask_percent
+        self.kernel = np.ones((1, 1), np.uint8)
+        self.random_trans=A.Compose([
+            A.Resize(height=224,width=224),
+            #A.HorizontalFlip(p=0.5),
+            #A.Rotate(limit=20),
+            #A.Blur(p=0.3),
+            #A.ElasticTransform(p=0.3)
+            ])
+        self.root_dir = 'dataset'
+        self.dataset_parts = dataset_records['dataset1']
 
+        self.bbox_path_list=[]
+        self.instance_images_path = []
+        self.instances = []
+        
+        if state == "train":
+            '''
+            dir_name_list=['0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f']
+            for dir_name in dir_name_list:
+                bbox_dir=os.path.join(args['dataset_dir'],'bbox','train_'+dir_name)
+                per_dir_file_list=os.listdir(bbox_dir)
+                for file_name in per_dir_file_list:
+                    if file_name not in bad_list:
+                        self.bbox_path_list.append(os.path.join(bbox_dir,file_name))
+            '''
+            for key in sorted(self.dataset_parts)[:-1]:
+                self.load_dataset_part(key)
+        elif state == "validation":
+            '''
+            bbox_dir=os.path.join(args['dataset_dir'],'bbox','validation')
+            per_dir_file_list=os.listdir(bbox_dir)
+            for file_name in per_dir_file_list:
+                if file_name not in bad_list:
+                    self.bbox_path_list.append(os.path.join(bbox_dir,file_name))
+            '''        
+            self.load_dataset_part(sorted(self.dataset_parts)[-1])
+        else:
+            '''
+            bbox_dir=os.path.join(args['dataset_dir'],'bbox','test')
+            per_dir_file_list=os.listdir(bbox_dir)
+            for file_name in per_dir_file_list:
+                if file_name not in bad_list:
+                    self.bbox_path_list.append(os.path.join(bbox_dir,file_name))
+            '''
+            self.load_dataset_part(sorted(self.dataset_parts)[-1])
+        #self.bbox_path_list.sort()
+        self.length=len(self.instances)
+        self.indices = [*range(self.length)]
+        
 
+    def __getitem__(self, index):
+        
+        indice = self.indices[index%self.length]
+        
+        instance=self.instances[indice]
+        img_path= self.instance_images_path[indice]
+
+        bbox=[instance['bbox'][0],instance['bbox'][1],
+              instance['bbox'][0]+instance['bbox'][2],
+              instance['bbox'][1]+instance['bbox'][3]]
+        img_p = Image.open(img_path).convert("RGB")
+   
+        ### Get reference image
+        bbox_pad=copy.copy(bbox)
+        bbox_pad[0]=bbox[0]-min(10,bbox[0]-0)
+        bbox_pad[1]=bbox[1]-min(10,bbox[1]-0)
+        bbox_pad[2]=bbox[2]+min(10,img_p.size[0]-bbox[2])
+        bbox_pad[3]=bbox[3]+min(10,img_p.size[1]-bbox[3])
+        img_p_np=cv2.imread(img_path)
+        img_p_np = cv2.cvtColor(img_p_np, cv2.COLOR_BGR2RGB)
+        ref_image_tensor=img_p_np[bbox_pad[1]:bbox_pad[3],bbox_pad[0]:bbox_pad[2],:]
+        ref_image_tensor=self.random_trans(image=ref_image_tensor)
+        ref_image_tensor=Image.fromarray(ref_image_tensor["image"])
+        ref_image_tensor=get_tensor_clip()(ref_image_tensor)
+
+        ### Generate mask
+        image_tensor = get_tensor()(img_p)
+        W,H = img_p.size
+
+        extended_bbox=copy.copy(bbox)
+        left_freespace=bbox[0]-0
+        right_freespace=W-bbox[2]
+        up_freespace=bbox[1]-0
+        down_freespace=H-bbox[3]
+        extended_bbox[0]=bbox[0]-random.randint(0,int(0.4*left_freespace))
+        extended_bbox[1]=bbox[1]-random.randint(0,int(0.4*up_freespace))
+        extended_bbox[2]=bbox[2]+random.randint(0,int(0.4*right_freespace))
+        extended_bbox[3]=bbox[3]+random.randint(0,int(0.4*down_freespace))
+
+        prob=random.uniform(0, 1)
+        if prob<self.arbitrary_mask_percent:
+            mask_img = Image.new('RGB', (W, H), (255, 255, 255)) 
+            bbox_mask=copy.copy(bbox)
+            extended_bbox_mask=copy.copy(extended_bbox)
+            top_nodes = np.asfortranarray([
+                            [bbox_mask[0],(bbox_mask[0]+bbox_mask[2])/2 , bbox_mask[2]],
+                            [bbox_mask[1], extended_bbox_mask[1], bbox_mask[1]],
+                        ])
+            down_nodes = np.asfortranarray([
+                    [bbox_mask[2],(bbox_mask[0]+bbox_mask[2])/2 , bbox_mask[0]],
+                    [bbox_mask[3], extended_bbox_mask[3], bbox_mask[3]],
+                ])
+            left_nodes = np.asfortranarray([
+                    [bbox_mask[0],extended_bbox_mask[0] , bbox_mask[0]],
+                    [bbox_mask[3], (bbox_mask[1]+bbox_mask[3])/2, bbox_mask[1]],
+                ])
+            right_nodes = np.asfortranarray([
+                    [bbox_mask[2],extended_bbox_mask[2] , bbox_mask[2]],
+                    [bbox_mask[1], (bbox_mask[1]+bbox_mask[3])/2, bbox_mask[3]],
+                ])
+            top_curve = bezier.Curve(top_nodes,degree=2)
+            right_curve = bezier.Curve(right_nodes,degree=2)
+            down_curve = bezier.Curve(down_nodes,degree=2)
+            left_curve = bezier.Curve(left_nodes,degree=2)
+            curve_list=[top_curve,right_curve,down_curve,left_curve]
+            pt_list=[]
+            random_width=5
+            for curve in curve_list:
+                x_list=[]
+                y_list=[]
+                for i in range(1,19):
+                    if (curve.evaluate(i*0.05)[0][0]) not in x_list and (curve.evaluate(i*0.05)[1][0] not in y_list):
+                        pt_list.append((curve.evaluate(i*0.05)[0][0]+random.randint(-random_width,random_width),curve.evaluate(i*0.05)[1][0]+random.randint(-random_width,random_width)))
+                        x_list.append(curve.evaluate(i*0.05)[0][0])
+                        y_list.append(curve.evaluate(i*0.05)[1][0])
+            mask_img_draw=ImageDraw.Draw(mask_img)
+            mask_img_draw.polygon(pt_list,fill=(0,0,0))
+            mask_tensor=get_tensor(normalize=False, toTensor=True)(mask_img)[0].unsqueeze(0)
+        else:
+            mask_img=np.zeros((H,W))
+            mask_img[extended_bbox[1]:extended_bbox[3],extended_bbox[0]:extended_bbox[2]]=1
+            mask_img=Image.fromarray(mask_img)
+            mask_tensor=1-get_tensor(normalize=False, toTensor=True)(mask_img)
+
+        ### Crop square image
+        if W > H:
+            left_most=extended_bbox[2]-H
+            if left_most <0:
+                left_most=0
+            right_most=extended_bbox[0]+H
+            if right_most > W:
+                right_most=W
+            right_most=right_most-H
+            if right_most<= left_most:
+                image_tensor_cropped=image_tensor
+                mask_tensor_cropped=mask_tensor
+            else:
+                left_pos=random.randint(left_most,right_most) 
+                free_space=min(extended_bbox[1]-0,extended_bbox[0]-left_pos,left_pos+H-extended_bbox[2],H-extended_bbox[3])
+                random_free_space=random.randint(0,int(0.6*free_space))
+                image_tensor_cropped=image_tensor[:,0+random_free_space:H-random_free_space,left_pos+random_free_space:left_pos+H-random_free_space]
+                mask_tensor_cropped=mask_tensor[:,0+random_free_space:H-random_free_space,left_pos+random_free_space:left_pos+H-random_free_space]
+        
+        elif  W < H:
+            upper_most=extended_bbox[3]-W
+            if upper_most <0:
+                upper_most=0
+            lower_most=extended_bbox[1]+W
+            if lower_most > H:
+                lower_most=H
+            lower_most=lower_most-W
+            if lower_most<=upper_most:
+                image_tensor_cropped=image_tensor
+                mask_tensor_cropped=mask_tensor
+            else:
+                upper_pos=random.randint(upper_most,lower_most) 
+                free_space=min(extended_bbox[1]-upper_pos,extended_bbox[0]-0,W-extended_bbox[2],upper_pos+W-extended_bbox[3])
+                random_free_space=random.randint(0,int(0.6*free_space))
+                image_tensor_cropped=image_tensor[:,upper_pos+random_free_space:upper_pos+W-random_free_space,random_free_space:W-random_free_space]
+                mask_tensor_cropped=mask_tensor[:,upper_pos+random_free_space:upper_pos+W-random_free_space,random_free_space:W-random_free_space]
+        else:
+            image_tensor_cropped=image_tensor
+            mask_tensor_cropped=mask_tensor
+
+        image_tensor_resize=T.Resize([self.args['image_size'],self.args['image_size']])(image_tensor_cropped)
+        mask_tensor_resize=T.Resize([self.args['image_size'],self.args['image_size']])(mask_tensor_cropped)
+        inpaint_tensor_resize=image_tensor_resize*mask_tensor_resize
+
+        return {"GT":image_tensor_resize,"inpaint_image":inpaint_tensor_resize,"inpaint_mask":mask_tensor_resize,"ref_imgs":ref_image_tensor}
+
+    def __len__(self):
+        return self.length
+
+    def load_dataset_part(self, dataset_dir,image_folder='crop_images',
+                          ann_file_dir='annotations/crop_instances_default.json',cat_ids=[1]):
+        coco = COCO(os.path.join(self.root_dir,dataset_dir,ann_file_dir))
+        instance_images_path = []
+        instances = []
+        
+        #以每个病变为单例进行输入
+        for ann_key in coco.anns:
+            ann = coco.anns[ann_key]
+            instance = {}
+            if len(ann["segmentation"])>0 and len(ann["segmentation"][0])>0 and (ann['category_id'] in cat_ids):#这里默认每个目标只有一个segmentation标注
+                instance["polygon"] = ann["segmentation"][0]
+                instance["bbox"] = ann["bbox"]
+                    
+                instance["cat_id"] = ann["category_id"]
+                
+                img = coco.loadImgs([ann["image_id"]])[0]
+                instance["img_dir"] = os.path.join(self.root_dir,dataset_dir,image_folder,img['file_name']).replace("/images/images/","/images/")
+                if not os.path.isfile(instance["img_dir"]):
+                    print(instance["img_dir"])
+                    continue
+                instance["img_shape"] = [img['width'],img['height']]
+                instance["img_width"],instance["img_height"] = img['width'],img['height']
+                
+                #check the boundary of the bbox
+                instance["bbox"] = check_and_fix_bbox(instance["bbox"],img["width"],img["height"])
+                
+                instance_images_path.append(instance["img_dir"])
+                instances.append(instance)        
+
+        self.instance_images_path += instance_images_path
+        self.instances += instances
+
+    def shuffle_data(self):
+        random.shuffle(self.indices)
+        
+if __name__ == "__main__":
+    gd = GastroDataset("train")
+    gd.shuffle_data()
+    gd.__getitem__(1)
